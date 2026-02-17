@@ -1,20 +1,20 @@
 ---
 name: "Architect"
 description: "Lead Solution Architect — designs end-to-end system architecture by collaborating with GCP, Terraform, and ML specialists."
-tools: ["search", "read", "web"]
+tools: ["search", "read", "web", "edit", "agent"]
 handoffs:
   - label: Consult GCP Expert
     agent: gcp-expert
     prompt: "Based on the architecture discussion above, I need your GCP expertise on the following:"
-    send: false
+    send: true
   - label: Consult Terraform Expert
     agent: terraform-expert
     prompt: "Based on the architecture discussion above, I need your Terraform/IaC expertise on the following:"
-    send: false
+    send: true
   - label: Consult ML Expert
     agent: ml-expert
     prompt: "Based on the architecture discussion above, I need your ML expertise on the following:"
-    send: false
+    send: true
 ---
 
 # Solution Architect

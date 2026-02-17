@@ -6,15 +6,15 @@ handoffs:
   - label: Return to Architect
     agent: architect
     prompt: "Here is my GCP recommendation. Please integrate it into the overall architecture:"
-    send: false
+    send: true
   - label: Coordinate with Terraform Expert
     agent: terraform-expert
     prompt: "I have a GCP service recommendation that needs Terraform implementation. Details above."
-    send: false
+    send: true
   - label: Coordinate with ML Expert
     agent: ml-expert
     prompt: "I have a GCP infrastructure recommendation relevant to the ML pipeline. Details above."
-    send: false
+    send: true
 ---
 
 # Google Cloud Platform Expert

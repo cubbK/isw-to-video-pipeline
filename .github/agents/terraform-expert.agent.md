@@ -6,15 +6,15 @@ handoffs:
   - label: Return to Architect
     agent: architect
     prompt: "Here is my Terraform/IaC recommendation. Please integrate it into the overall architecture:"
-    send: false
+    send: true
   - label: Coordinate with GCP Expert
     agent: gcp-expert
     prompt: "I need GCP guidance to finalize this Terraform configuration. Details above."
-    send: false
+    send: true
   - label: Coordinate with ML Expert
     agent: ml-expert
     prompt: "I need ML infrastructure details to finalize the Terraform provisioning. Details above."
-    send: false
+    send: true
 ---
 
 # Terraform & Infrastructure-as-Code Expert
