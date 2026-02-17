@@ -15,6 +15,10 @@ handoffs:
     agent: ml-expert
     prompt: "Based on the architecture discussion above, I need your ML expertise on the following:"
     send: true
+  - label: Direct Implementer
+    agent: implementer
+    prompt: "Here is the architectural decision. Please proceed with implementation:"
+    send: false
 ---
 
 # Solution Architect

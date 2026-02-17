@@ -15,6 +15,10 @@ handoffs:
     agent: ml-expert
     prompt: "I need ML infrastructure details to finalize the Terraform provisioning. Details above."
     send: true
+  - label: Return to Implementer
+    agent: implementer
+    prompt: "Here is the Terraform module/config for your implementation:"
+    send: false
 ---
 
 # Terraform & Infrastructure-as-Code Expert

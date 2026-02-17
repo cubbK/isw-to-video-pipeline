@@ -15,6 +15,10 @@ handoffs:
     agent: terraform-expert
     prompt: "I need Terraform provisioning for this ML infrastructure. Details above."
     send: true
+  - label: Return to Implementer
+    agent: implementer
+    prompt: "Here is my ML recommendation for your implementation:"
+    send: false
 ---
 
 # Machine Learning & MLOps Expert

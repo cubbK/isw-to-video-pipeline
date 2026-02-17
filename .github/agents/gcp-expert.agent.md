@@ -15,6 +15,10 @@ handoffs:
     agent: ml-expert
     prompt: "I have a GCP infrastructure recommendation relevant to the ML pipeline. Details above."
     send: true
+  - label: Return to Implementer
+    agent: implementer
+    prompt: "Here is my GCP recommendation for your implementation:"
+    send: false
 ---
 
 # Google Cloud Platform Expert
