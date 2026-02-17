@@ -459,17 +459,17 @@ gs://isw-video-pipeline-<env>/
 
 ## 4. Security
 
-| Concern          | Solution                                                                                               |
-| ---------------- | ------------------------------------------------------------------------------------------------------ |
-| YouTube OAuth    | Tokens in Secret Manager, accessed only by upload service account                                      |
-| Vertex AI access | Dedicated SA with `roles/aiplatform.user`                                                              |
-| GCS access       | Per-service least-privilege IAM (ingestion writes `raw/`, etc.)                                        |
-| Network          | Cloud Run services are internal-only (ingress = `internal`), invoked by Workflows                      |
-| Secrets          | Secret Manager for all credentials (including Custom Search API key)                                   |
-| API keys         | Custom Search API key in Secret Manager, all other auth via service accounts + Workload Identity       |
-| Data retention   | GCS lifecycle: delete `raw/`, `parsed/`, `audio/`, `visuals/` after 30 days; keep `output/` for 1 year |
-| Workflow auth    | Workflows uses a dedicated SA with `roles/run.invoker` on each Cloud Run service                       |
-| Image licensing  | Attribution tracked in `image_attribution.json`, included in YouTube description; blocklist enforced   |
+| Concern          | Solution                                                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| YouTube OAuth    | Tokens in Secret Manager, accessed only by upload service account                                                      |
+| Vertex AI access | Dedicated SA with `roles/aiplatform.user`                                                                              |
+| GCS access       | Per-service least-privilege IAM (ingestion writes `raw/`, etc.)                                                        |
+| Network          | Cloud Run services use `ingress = all` with `--no-allow-unauthenticated`; security enforced via IAM only (see ADR-006) |
+| Secrets          | Secret Manager for all credentials (including Custom Search API key)                                                   |
+| API keys         | Custom Search API key in Secret Manager, all other auth via service accounts + Workload Identity                       |
+| Data retention   | GCS lifecycle: delete `raw/`, `parsed/`, `audio/`, `visuals/` after 30 days; keep `output/` for 1 year                 |
+| Workflow auth    | Workflows uses a dedicated SA with `roles/run.invoker` on each Cloud Run service                                       |
+| Image licensing  | Attribution tracked in `image_attribution.json`, included in YouTube description; blocklist enforced                   |
 
 ---
 
@@ -482,15 +482,37 @@ gs://isw-video-pipeline-<env>/
 | Cloud Run Jobs (FFmpeg assembly)                    | 30 jobs × 4 vCPU × 5 min         | ~$3–5             |
 | Vertex AI Gemini 2.0 Flash                          | 30 calls × ~5K tokens            | ~$0.50            |
 | Google Custom Search API                            | ~90 queries (free tier: 100/day) | $0                |
-| Cloud Text-to-Speech (Neural2)                      | ~150K chars                      | ~$24              |
+| Cloud Text-to-Speech (Studio)                       | ~150K chars                      | ~$24              |
 | Cloud Storage                                       | ~10 GB                           | ~$0.20            |
+| Artifact Registry                                   | ~2 GB Docker images              | ~$0.20            |
 | YouTube Data API                                    | Free tier                        | $0                |
 | Secret Manager                                      | ~6 secrets                       | ~$0.04            |
 | **Total**                                           |                                  | **~$30–33/month** |
 
 ---
 
-## 6. Architecture Decision Records
+## 6. Required GCP APIs
+
+The following APIs must be enabled on the project (managed via Terraform `google_project_service`):
+
+```
+cloudrun.googleapis.com
+workflows.googleapis.com
+cloudscheduler.googleapis.com
+texttospeech.googleapis.com
+aiplatform.googleapis.com
+secretmanager.googleapis.com
+customsearch.googleapis.com
+storage.googleapis.com
+cloudbuild.googleapis.com
+artifactregistry.googleapis.com
+logging.googleapis.com
+monitoring.googleapis.com
+```
+
+---
+
+## 7. Architecture Decision Records
 
 ### ADR-001: Use ISW's published maps instead of custom map generation
 
@@ -530,28 +552,37 @@ gs://isw-video-pipeline-<env>/
   - **No hallucinated visuals** — AI image generation can produce inaccurate or misleading editorial imagery. Real photos are grounded in reality.
 - **Tradeoff**: Dependency on image availability — some niche topics may not return good results. Mitigated with a 3-tier fallback chain: (1) retry with broader query, (2) curated fallback stock images, (3) use the overview map as a last resort. Image licensing must be tracked and attributed.
 
+### ADR-006: IAM-based auth instead of network-level ingress restriction
+
+- **Context**: Cloud Run services need to be invocable by Cloud Workflows but not publicly accessible.
+- **Decision**: Use `ingress = all` with `--no-allow-unauthenticated` (IAM-only authentication) instead of `ingress = internal`.
+- **Rationale**: Cloud Workflows invokes Cloud Run over the public internet by default. Using `ingress = internal` would require a Serverless VPC Access connector (~$7/month) or complex networking. IAM-based auth (`roles/run.invoker` on the Workflows SA) provides equivalent security — only callers with the correct service account token can invoke the service, regardless of network path. This is the pattern Google recommends for Workflows → Cloud Run integration.
+- **Tradeoff**: Services are network-reachable (though unauthenticated requests get 403). Mitigated by IAM policy — only the Workflows SA and deployment SAs have `roles/run.invoker`.
+
 ---
 
-## 7. Service Map & Terraform Modules
+## 8. Service Map & Terraform Modules
+
+Docker images for all services are stored in **Artifact Registry** (`us-central1-docker.pkg.dev/<project>/isw-pipeline`).
 
 ```
 terraform/
 ├── modules/
-│   ├── networking/          # VPC, serverless VPC connector (if needed)
-│   ├── storage/             # GCS buckets, lifecycle rules
-│   ├── iam/                 # Service accounts, role bindings
-│   ├── secrets/             # Secret Manager secrets
-│   ├── cloud-run/           # All Cloud Run services + jobs
-│   │   ├── ingestion/
-│   │   ├── script-gen/
-│   │   ├── tts/
-│   │   ├── map-renderer/
-│   │   ├── image-search/
-│   │   ├── title-gen/
-│   │   ├── video-assembly/  # Cloud Run Job
-│   │   └── youtube-upload/
-│   ├── workflows/           # Workflow definition + Cloud Scheduler
-│   └── monitoring/          # Alerting policies, log-based metrics
+│   ├── cloud-run-service/       # Reusable module — one Cloud Run service
+│   │   ├── main.tf              # google_cloud_run_v2_service
+│   │   ├── variables.tf         # name, image, env_vars, sa, memory, cpu
+│   │   └── outputs.tf           # service URL
+│   ├── cloud-run-job/           # Reusable module — one Cloud Run Job
+│   │   ├── main.tf              # google_cloud_run_v2_job
+│   │   ├── variables.tf         # name, image, sa, memory, cpu, timeout
+│   │   └── outputs.tf
+│   ├── storage/                 # GCS buckets, lifecycle rules
+│   ├── iam/                     # All service accounts + role bindings
+│   ├── secrets/                 # Secret Manager secrets
+│   ├── artifact-registry/       # Docker image repository
+│   ├── apis/                    # google_project_service for all required APIs
+│   ├── workflows/               # Workflow definition + Cloud Scheduler
+│   └── monitoring/              # Alerting policies, log-based metrics
 ├── environments/
 │   ├── dev/
 │   │   └── main.tf
@@ -559,14 +590,51 @@ terraform/
 │   │   └── main.tf
 │   └── prod/
 │       └── main.tf
-├── backend.tf               # GCS remote state
+├── backend.tf                   # GCS remote state (separate bucket: isw-pipeline-tfstate)
 ├── variables.tf
 └── versions.tf
 ```
 
+**Cloud Run service instances** (all use the reusable `cloud-run-service` module):
+
+```hcl
+# Example: environments/prod/main.tf
+
+module "ingestion" {
+  source   = "../../modules/cloud-run-service"
+  name     = "isw-pipeline-prod-ingestion"
+  image    = "${var.registry}/ingestion:${var.image_tag}"
+  sa_email = module.iam.sa_ingestion_email
+  env_vars = { BUCKET = module.storage.work_bucket_name }
+  memory   = "512Mi"
+  cpu      = "1"
+}
+
+module "script_gen" {
+  source   = "../../modules/cloud-run-service"
+  name     = "isw-pipeline-prod-script-gen"
+  image    = "${var.registry}/script-gen:${var.image_tag}"
+  sa_email = module.iam.sa_script_gen_email
+  memory   = "512Mi"
+  cpu      = "1"
+}
+
+# ... same pattern for tts, map-renderer, image-search, title-gen, youtube-upload
+
+module "video_assembly" {
+  source   = "../../modules/cloud-run-job"
+  name     = "isw-pipeline-prod-video-assembly"
+  image    = "${var.registry}/video-assembly:${var.image_tag}"
+  sa_email = module.iam.sa_assembly_email
+  memory   = "8Gi"
+  cpu      = "4"
+  timeout  = "900s"
+}
+```
+
 ---
 
-## 8. Implementation Order
+## 9. Implementation Order
 
 | Phase  | What                                          | Deliverable                        |
 | ------ | --------------------------------------------- | ---------------------------------- |
@@ -585,12 +653,10 @@ terraform/
 
 ---
 
-## 9. Open Questions
+## 10. Open Questions
 
-| #   | Question                                                                                         | Owner            |
-| --- | ------------------------------------------------------------------------------------------------ | ---------------- |
-| 1   | Multi-language support (Ukrainian narration)? Affects TTS voice and script generation prompts.   | Product          |
-| 2   | Custom animated maps (Mapbox/Leaflet) vs ISW maps? Custom allows front-line animation over time. | ML Expert        |
-| 3   | Cloud Run Jobs vs Cloud Batch for FFmpeg assembly? Batch supports GPUs for faster encoding.      | GCP Expert       |
-| 4   | Terraform module split — by pipeline stage or by GCP service type? Current plan: by stage.       | Terraform Expert |
-| 5   | Should we curate a larger fallback image library, or is ~6 topic images sufficient?              | Product          |
+| #   | Question                                                                                                              | Owner   |
+| --- | --------------------------------------------------------------------------------------------------------------------- | ------- |
+| 1   | Multi-language support (Ukrainian narration)? Affects TTS voice and script generation prompts.                        | Product |
+| 2   | Custom animated maps (Mapbox/Leaflet) vs ISW maps? Custom allows front-line animation over time. Deferred to Phase 2. | Product |
+| 3   | Should we curate a larger fallback image library, or is ~6 topic images sufficient?                                   | Product |
