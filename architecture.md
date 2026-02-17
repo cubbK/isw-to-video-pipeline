@@ -15,7 +15,7 @@ An automated daily pipeline that ingests an ISW (Institute for the Study of War)
                                        │                         │
  ingest_report ──▶ generate_script ────┼─── render_maps ─────────┼──▶ assemble_video ──▶ upload_youtube
                                        │                         │
-                                       ├─── generate_images ────┘
+                                       ├─── search_images ──────┘
                                        │
                                        └─── generate_title_cards ┘
 ```
@@ -102,8 +102,8 @@ An automated daily pipeline that ingests an ISW (Institute for the Study of War)
       "segment_id": 1,
       "segment_title": "Geneva Talks Preview",
       "narration_text": "Russian officials are heading to Geneva...",
-      "visual_type": "generated_image",
-      "visual_prompt": "Diplomatic summit conference room, photojournalistic style",
+      "visual_type": "web_image",
+      "image_search_query": "Geneva diplomatic summit Ukraine Russia 2026",
       "map_region": null,
       "estimated_duration_seconds": 45
     },
@@ -112,7 +112,7 @@ An automated daily pipeline that ingests an ISW (Institute for the Study of War)
       "segment_title": "Energy Infrastructure at Risk",
       "narration_text": "Ukraine plans to raise the issue of...",
       "visual_type": "map",
-      "visual_prompt": null,
+      "image_search_query": null,
       "map_region": "overview",
       "estimated_duration_seconds": 40
     }
@@ -122,6 +122,7 @@ An automated daily pipeline that ingests an ISW (Institute for the Study of War)
 
 - Persona: neutral news anchor, factual, no editorializing.
 - Validation: post-generation check that script only references facts present in input.
+- For `web_image` segments, Gemini generates an `image_search_query` — a concise, specific search string designed to find a relevant editorial/news photo on the open web.
 
 ---
 
@@ -174,21 +175,61 @@ An automated daily pipeline that ingests an ISW (Institute for the Study of War)
   - Resize/pad to 1920×1080.
 - Map region → ISW map URL mapping derived from parsed `conflict-map-block` sections.
 
-#### 2.4b Image Generation — Vertex AI Imagen 3
+#### 2.4b Web Image Search — Cloud Run Service
 
-| Field       | Value                                                                 |
-| ----------- | --------------------------------------------------------------------- |
-| GCP Service | Vertex AI Imagen 3                                                    |
-| Purpose     | Generate editorial images for non-map segments                        |
-| Inputs      | `visual_prompt` from segments where `visual_type = "generated_image"` |
-| Outputs     | `gs://<bucket>/visuals/<date>/images/*.png` (1920×1080)               |
+| Field       | Value                                                                              |
+| ----------- | ---------------------------------------------------------------------------------- |
+| GCP Service | Cloud Run                                                                          |
+| Purpose     | Find relevant editorial/news photos from the web for non-map segments              |
+| Inputs      | `image_search_query` from segments where `visual_type = "web_image"`               |
+| Outputs     | `gs://<bucket>/visuals/<date>/images/*.png` (1920×1080) + `image_attribution.json` |
 
 **Details:**
 
-- Used for segments covering diplomacy, energy, drone tech — topics with no map.
-- Safety filters enabled (no violence, no real individuals).
-- Style prompt suffix: ", photojournalistic style, editorial news photo, no text".
-- ~2-3 images per report.
+- Uses **Google Custom Search JSON API** (Image Search) to find relevant photos.
+- Search flow per segment:
+  1. Take the `image_search_query` from the script (e.g., "Geneva diplomatic summit Ukraine Russia 2026").
+  2. Call Custom Search API with `searchType=image`, `imgSize=xlarge`, `imgType=photo`, `rights=cc_publicdomain|cc_attribute` (prefer openly licensed images).
+  3. Receive ranked results with image URLs, source pages, and metadata.
+  4. Apply filtering:
+     - Prefer images from **news agencies** (Reuters, AP, AFP, EPA) and **official sources** (gov.ua, nato.int, un.org).
+     - Exclude results from social media, meme sites, or low-resolution sources.
+     - Minimum resolution: 1200px wide.
+  5. Download the top-ranked image.
+  6. Post-process with Pillow:
+     - Resize/crop to 1920×1080 (center-crop or letterbox depending on aspect ratio).
+     - Apply subtle vignette and color grade for visual consistency across the video.
+     - Add source attribution overlay in bottom-right corner (small text: "Photo: Reuters" etc.).
+  7. Save the image to GCS and record attribution metadata.
+
+- **Attribution tracking** — `image_attribution.json` records for each image:
+
+  ```json
+  {
+    "segment_id": 1,
+    "source_url": "https://www.reuters.com/...",
+    "source_name": "Reuters",
+    "license": "Editorial use",
+    "original_url": "https://...",
+    "search_query": "Geneva diplomatic summit Ukraine Russia 2026"
+  }
+  ```
+
+  This is included in the YouTube description for proper attribution.
+
+- **Fallback chain** — if Custom Search returns no suitable results:
+  1. Retry with a broader query (Gemini generates a fallback query at script time).
+  2. If still no results, fall back to a **static stock image** from a curated library in `gs://<bucket>/assets/fallback_images/` organized by topic:
+     - `diplomacy.png`, `energy.png`, `military.png`, `drone.png`, `sanctions.png`, etc.
+  3. Never leave a segment without a visual.
+
+- **API quota**: Google Custom Search API provides 100 free queries/day. At ~2-3 image searches per report, this stays well within the free tier. If volume increases, paid tier is $5 per 1000 queries.
+
+- **Legal considerations**:
+  - Prefer Creative Commons or public domain licensed images (`rights` parameter in API).
+  - For editorial/news images used under fair use: the video is a non-commercial news summary with source attribution.
+  - Attribution is displayed in the video overlay AND in the YouTube description.
+  - Maintain a blocklist of domains to never use (e.g., Getty — strict licensing).
 
 #### 2.4c Title Cards & Lower Thirds — Cloud Run Service
 
@@ -234,12 +275,12 @@ An automated daily pipeline that ingests an ISW (Institute for the Study of War)
 
 ### 2.6 YouTube Upload — Cloud Run Service
 
-| Field       | Value                                       |
-| ----------- | ------------------------------------------- |
-| GCP Service | Cloud Run                                   |
-| Purpose     | Upload video to YouTube with metadata       |
-| Inputs      | `final.mp4`, `subtitles.srt`, `script.json` |
-| Outputs     | YouTube video ID                            |
+| Field       | Value                                                                 |
+| ----------- | --------------------------------------------------------------------- |
+| GCP Service | Cloud Run                                                             |
+| Purpose     | Upload video to YouTube with metadata                                 |
+| Inputs      | `final.mp4`, `subtitles.srt`, `script.json`, `image_attribution.json` |
+| Outputs     | YouTube video ID                                                      |
 
 **Details:**
 
@@ -247,11 +288,12 @@ An automated daily pipeline that ingests an ISW (Institute for the Study of War)
 - Upload as **unlisted** (human reviews via Slack notification, then manually sets to public).
 - Auto-generated metadata from `script.json`:
   - **Title**: `script.title`
-  - **Description**: key takeaways + link to original ISW report
+  - **Description**: key takeaways + link to original ISW report + image attribution credits
   - **Tags**: `script.tags`
   - **Thumbnail**: overview map image
   - **Captions**: `.srt` upload
 - OAuth2 credentials in Secret Manager.
+- Image attributions from `image_attribution.json` appended to description under a "Image Credits" section.
 
 ---
 
@@ -316,10 +358,10 @@ main:
                     script_path: ${script_result.body.script_path}
                 result: maps_result
 
-            - generate_images:
+            - search_images:
                 call: http.post
                 args:
-                  url: ${IMAGE_GEN_SERVICE_URL}
+                  url: ${IMAGE_SEARCH_SERVICE_URL}
                   body:
                     script_path: ${script_result.body.script_path}
                 result: images_result
@@ -394,14 +436,23 @@ gs://isw-video-pipeline-<env>/
 │       └── lower_01.png ... lower_N.png
 ├── output/<date>/
 │   ├── final.mp4
-│   └── subtitles.srt
+│   ├── subtitles.srt
+│   └── image_attribution.json
 └── assets/                         # Static, version-controlled
     ├── background_music.mp3
     ├── pronunciation_dict.json
-    └── brand_templates/
-        ├── intro_template.png
-        ├── outro_template.png
-        └── lower_third_template.png
+    ├── brand_templates/
+    │   ├── intro_template.png
+    │   ├── outro_template.png
+    │   └── lower_third_template.png
+    ├── fallback_images/            # Curated stock images by topic
+    │   ├── diplomacy.png
+    │   ├── energy.png
+    │   ├── military.png
+    │   ├── drone.png
+    │   ├── sanctions.png
+    │   └── humanitarian.png
+    └── image_search_blocklist.json  # Domains to never source images from
 ```
 
 ---
@@ -414,27 +465,28 @@ gs://isw-video-pipeline-<env>/
 | Vertex AI access | Dedicated SA with `roles/aiplatform.user`                                                              |
 | GCS access       | Per-service least-privilege IAM (ingestion writes `raw/`, etc.)                                        |
 | Network          | Cloud Run services are internal-only (ingress = `internal`), invoked by Workflows                      |
-| Secrets          | Secret Manager for all credentials                                                                     |
-| API keys         | No API keys in code — service accounts + Workload Identity only                                        |
+| Secrets          | Secret Manager for all credentials (including Custom Search API key)                                   |
+| API keys         | Custom Search API key in Secret Manager, all other auth via service accounts + Workload Identity       |
 | Data retention   | GCS lifecycle: delete `raw/`, `parsed/`, `audio/`, `visuals/` after 30 days; keep `output/` for 1 year |
 | Workflow auth    | Workflows uses a dedicated SA with `roles/run.invoker` on each Cloud Run service                       |
+| Image licensing  | Attribution tracked in `image_attribution.json`, included in YouTube description; blocklist enforced   |
 
 ---
 
 ## 5. Cost Estimate (Monthly — 30 videos)
 
-| Component                                   | Usage                         | Est. Cost         |
-| ------------------------------------------- | ----------------------------- | ----------------- |
-| Cloud Workflows + Cloud Scheduler           | 30 executions                 | ~$0.15            |
-| Cloud Run (ingestion, maps, titles, upload) | ~120 invocations, <1 min each | ~$1–2             |
-| Cloud Run Jobs (FFmpeg assembly)            | 30 jobs × 4 vCPU × 5 min      | ~$3–5             |
-| Vertex AI Gemini 2.0 Flash                  | 30 calls × ~5K tokens         | ~$0.50            |
-| Vertex AI Imagen 3                          | ~90 images                    | ~$3–5             |
-| Cloud Text-to-Speech (Neural2)              | ~150K chars                   | ~$24              |
-| Cloud Storage                               | ~10 GB                        | ~$0.20            |
-| YouTube Data API                            | Free tier                     | $0                |
-| Secret Manager                              | ~5 secrets                    | ~$0.03            |
-| **Total**                                   |                               | **~$35–40/month** |
+| Component                                           | Usage                            | Est. Cost         |
+| --------------------------------------------------- | -------------------------------- | ----------------- |
+| Cloud Workflows + Cloud Scheduler                   | 30 executions                    | ~$0.15            |
+| Cloud Run (ingestion, maps, images, titles, upload) | ~150 invocations, <1 min each    | ~$1–2             |
+| Cloud Run Jobs (FFmpeg assembly)                    | 30 jobs × 4 vCPU × 5 min         | ~$3–5             |
+| Vertex AI Gemini 2.0 Flash                          | 30 calls × ~5K tokens            | ~$0.50            |
+| Google Custom Search API                            | ~90 queries (free tier: 100/day) | $0                |
+| Cloud Text-to-Speech (Neural2)                      | ~150K chars                      | ~$24              |
+| Cloud Storage                                       | ~10 GB                           | ~$0.20            |
+| YouTube Data API                                    | Free tier                        | $0                |
+| Secret Manager                                      | ~6 secrets                       | ~$0.04            |
+| **Total**                                           |                                  | **~$30–33/month** |
 
 ---
 
@@ -467,6 +519,17 @@ gs://isw-video-pipeline-<env>/
 - **Rationale**: ~$0.15/month vs ~$300+/month for Composer. The pipeline has no need for Airflow's backfill, XComs, complex branching, or plugin ecosystem. Workflows natively supports parallel branches, retries, and HTTP service invocation.
 - **Tradeoff**: No built-in UI for run history inspection. Mitigated with Cloud Logging + a simple Cloud Run dashboard if needed later.
 
+### ADR-005: Web image search instead of AI image generation
+
+- **Context**: Non-map segments (diplomacy, energy, drone tech) need accompanying visuals.
+- **Decision**: Use Google Custom Search API (Image Search) to find real editorial/news photos from the web instead of generating images with Vertex AI Imagen 3.
+- **Rationale**:
+  - **Authenticity** — real news photos are more credible for a news-style video than AI-generated imagery. Audiences increasingly distrust AI-generated visuals in news contexts.
+  - **Cost** — Custom Search API is free for up to 100 queries/day (we use ~3/day). Imagen 3 at ~90 images/month cost $3–5.
+  - **Speed** — an API call + image download is faster than image generation (~1s vs ~10s).
+  - **No hallucinated visuals** — AI image generation can produce inaccurate or misleading editorial imagery. Real photos are grounded in reality.
+- **Tradeoff**: Dependency on image availability — some niche topics may not return good results. Mitigated with a 3-tier fallback chain: (1) retry with broader query, (2) curated fallback stock images, (3) use the overview map as a last resort. Image licensing must be tracked and attributed.
+
 ---
 
 ## 7. Service Map & Terraform Modules
@@ -483,7 +546,7 @@ terraform/
 │   │   ├── script-gen/
 │   │   ├── tts/
 │   │   ├── map-renderer/
-│   │   ├── image-gen/
+│   │   ├── image-search/
 │   │   ├── title-gen/
 │   │   ├── video-assembly/  # Cloud Run Job
 │   │   └── youtube-upload/
@@ -505,18 +568,18 @@ terraform/
 
 ## 8. Implementation Order
 
-| Phase  | What                                          | Deliverable                      |
-| ------ | --------------------------------------------- | -------------------------------- |
-| **1**  | Ingestion & parsing service                   | Cloud Run service + unit tests   |
-| **2**  | Script generation (Gemini prompt engineering) | Cloud Run service + prompt tests |
-| **3**  | TTS narration service                         | Cloud Run service                |
-| **4**  | Map rendering + title card generation         | Cloud Run service                |
-| **5**  | Image generation (Imagen 3)                   | Cloud Run service                |
-| **6**  | Video assembly (FFmpeg)                       | Cloud Run Job + assembly tests   |
-| **7**  | YouTube upload service                        | Cloud Run service                |
-| **8**  | Workflow definition + Scheduler               | Cloud Workflows YAML             |
-| **9**  | Terraform infrastructure                      | All modules + CI/CD              |
-| **10** | End-to-end testing + monitoring               | Integration tests + alerting     |
+| Phase  | What                                          | Deliverable                        |
+| ------ | --------------------------------------------- | ---------------------------------- |
+| **1**  | Ingestion & parsing service                   | Cloud Run service + unit tests     |
+| **2**  | Script generation (Gemini prompt engineering) | Cloud Run service + prompt tests   |
+| **3**  | TTS narration service                         | Cloud Run service                  |
+| **4**  | Map rendering + title card generation         | Cloud Run service                  |
+| **5**  | Web image search service                      | Cloud Run service + fallback tests |
+| **6**  | Video assembly (FFmpeg)                       | Cloud Run Job + assembly tests     |
+| **7**  | YouTube upload service                        | Cloud Run service                  |
+| **8**  | Workflow definition + Scheduler               | Cloud Workflows YAML               |
+| **9**  | Terraform infrastructure                      | All modules + CI/CD                |
+| **10** | End-to-end testing + monitoring               | Integration tests + alerting       |
 
 > **Recommended start**: Phase 1–3 can be prototyped locally as plain Python scripts before deploying to Cloud Run. This validates the core logic (parse → summarize → narrate) without any infrastructure.
 
@@ -530,3 +593,4 @@ terraform/
 | 2   | Custom animated maps (Mapbox/Leaflet) vs ISW maps? Custom allows front-line animation over time. | ML Expert        |
 | 3   | Cloud Run Jobs vs Cloud Batch for FFmpeg assembly? Batch supports GPUs for faster encoding.      | GCP Expert       |
 | 4   | Terraform module split — by pipeline stage or by GCP service type? Current plan: by stage.       | Terraform Expert |
+| 5   | Should we curate a larger fallback image library, or is ~6 topic images sufficient?              | Product          |
