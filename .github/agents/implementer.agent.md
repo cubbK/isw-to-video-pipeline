@@ -6,19 +6,19 @@ handoffs:
   - label: Ask GCP Expert
     agent: gcp-expert
     prompt: "I'm implementing a pipeline service and need your GCP expertise on the following:"
-    send: false
+    send: true
   - label: Ask Terraform Expert
     agent: terraform-expert
     prompt: "I'm implementing infrastructure and need your Terraform/IaC expertise on the following:"
-    send: false
+    send: true
   - label: Ask ML Expert
     agent: ml-expert
     prompt: "I'm implementing an ML-related service and need your expertise on the following:"
-    send: false
+    send: true
   - label: Escalate to Architect
     agent: architect
     prompt: "I've encountered an architectural question during implementation that needs your decision:"
-    send: false
+    send: true
 ---
 
 # Implementation Engineer
